@@ -1,0 +1,299 @@
+create or replace table Transactions
+(
+Date DATE,
+Transaction_ID_Dealership_Car_Reference_VT string(50),
+Vehicles_sold integer
+);
+
+create or replace table Marketing
+(
+D_S_ID string,
+Marketing_Division string,
+State string,
+Zip_Code string
+);
+
+create or replace table Dealership_Details
+(
+Dealership_Selling_ID string,
+Dealership_Sales_Revenue integer,
+Dealership_Operational_Expenses integer
+);
+
+List @Slate_Data;
+
+COPY INTO Marketing
+FROM @SLATE_DATA/Marketing.csv
+file_format = (type = CSV, skip_header=1);
+
+COPY INTO Dealership_Details
+FROM @SLATE_DATA/Dealership.csv
+file_format = (type = CSV, skip_header=1, ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE);
+
+COPY INTO Transactions
+FROM @SLATE_DATA/Transactions.csv
+file_format = (type = CSV, skip_header=1, DATE_FORMAT="DD/MM/YYYY");
+
+SELECT * 
+FROM Transactions
+LIMIT 10;
+
+CREATE VIEW Transaction_Table_Transformed AS
+SELECT Date, 
+    SUBSTR(TRANSACTION_ID_DEALERSHIP_CAR_REFERENCE_VT, 1, 20) AS Dealership_ID_Transaction_ID,
+    SUBSTR(TRANSACTION_ID_DEALERSHIP_CAR_REFERENCE_VT, 1, 10) AS Dealership_ID,
+    SUBSTR(TRANSACTION_ID_DEALERSHIP_CAR_REFERENCE_VT, 12, 9) AS Transaction_ID,
+    SUBSTR(TRANSACTION_ID_DEALERSHIP_CAR_REFERENCE_VT, 22, 2) AS Car_Model,
+    SUBSTR(TRANSACTION_ID_DEALERSHIP_CAR_REFERENCE_VT, 25, 3) AS EV_Type,
+    Vehicles_Sold,
+    CASE WHEN Car_Model = 'A1' THEN 'Vans'
+        WHEN Car_Model = 'A2' THEN 'Coupe'
+        WHEN Car_Model = 'A3' THEN 'Cruiser'
+        WHEN Car_Model = 'A4' THEN 'Pickup Truck'
+        WHEN Car_Model = 'A5' THEN 'Luxury Sedan'
+        WHEN Car_Model = 'A6' THEN 'Convertible'
+        WHEN Car_Model = 'A7' THEN 'Hybrid'
+        WHEN Car_Model = 'A8' THEN 'Sedan'
+        WHEN Car_Model = 'A9' THEN 'Hatchback'
+        WHEN Car_Model = 'A10' THEN 'SUV'
+        WHEN Car_Model = 'A11' THEN 'Minivan'
+        ELSE 'Other' END AS Car_Model_Type
+FROM Transactions;
+
+CREATE OR REPLACE VIEW ALL_Records_Joined AS
+SELECT *
+FROM TRANSACTION_TABLE_TRANSFORMED
+INNER JOIN Dealership_Details
+ON TRANSACTION_TABLE_TRANSFORMED.DEALERSHIP_ID_TRANSACTION_ID = Dealership_Details.DEALERSHIP_SELLING_ID
+INNER JOIN Marketing
+ON Dealership_Details.DEALERSHIP_SELLING_ID = Marketing.D_S_ID;
+
+CREATE OR REPLACE VIEW Completed_Data_View AS 
+SELECT *,
+    Profitability/(SELECT SUM(DEALERSHIP_SALES_REVENUE) FROM ALL_Records_Joined) AS Profit_Margin_Pct
+FROM(
+SELECT *,
+    DEALERSHIP_SALES_REVENUE-Dealership_Operational_Expenses AS Profitability
+FROM ALL_Records_Joined);
+
+CREATE OR REPLACE VIEW Market_Awareness_Monthly_Growth AS
+SELECT MONTH(Date) AS Month,
+    MARKETING_DIVISION,
+    AVG(VEHICLES_SOLD) AS Average_Vehicles_Sold,
+    AVG(DEALERSHIP_SALES_REVENUE) AS Average_Sales_Revenue,
+    AVG(PROFITABILITY) AS Average_Profitability,
+    SUM(VEHICLES_SOLD) AS Total_Vehicles_Sold,
+    SUM(DEALERSHIP_SALES_REVENUE) AS Total_Sales_Revenue,
+    SUM(PROFITABILITY) AS Total_Profitability
+FROM Completed_Data_View
+GROUP BY Month, MARKETING_DIVISION
+ORDER BY Month, MARKETING_DIVISION;
+
+CREATE OR REPLACE VIEW Date_Dimension_View AS
+SELECT DATE
+,DATE_PART('EPOCH_MILLISECONDS',DATE) AS EPOCH_MILLISECONDS
+,YEAR(DATE) AS YEAR
+,MONTH(DATE) AS MONTH
+,MONTHNAME(DATE) AS MONTH_NAME
+,DAY(DATE) AS DAY_OF_MON
+,DAYOFWEEK(DATE) AS DAY_OF_WEEK
+,WEEKOFYEAR(DATE) AS WEEK_OF_YEAR
+,DAYOFYEAR(DATE) AS DAY_OF_YEAR
+,LEFT(DATE,10) as DATE_YYYY_MM_DD
+FROM (SELECT TO_TIMESTAMP_LTZ(DATEADD(DAY, SEQ4(), '2019-01-01')) DATE
+FROM TABLE(GENERATOR(ROWCOUNT=>365)));
+
+CREATE VIEW State_Permutations AS
+SELECT DISTINCT State
+FROM COMPLETED_DATA_VIEW
+ORDER BY State;
+
+CREATE OR REPLACE VIEW Car_Model_Permutations AS
+SELECT DISTINCT Car_Model
+FROM COMPLETED_DATA_VIEW
+ORDER BY Car_Model;
+
+CREATE VIEW Date_Permutations AS
+SELECT DATE_YYYY_MM_DD
+FROM Date_Dimension_View;
+
+DROP VIEW SATE_PERMUTATIONS;
+DROP VIEW DATE_PERMUTATIONS;
+
+CREATE OR REPLACE VIEW CONCATENATED_VIEW AS
+SELECT *,
+    CONCAT_WS('-', STATE, MODEL, DATE) AS CONCAT_KEY
+FROM(
+SELECT STATE_PERMUTATIONS.STATE AS STATE, 
+    CAR_MODEL_PERMUTATIONS.CAR_MODEL AS MODEL,
+    DATE_DIMENSION_VIEW.DATE_YYYY_MM_DD as DATE
+FROM STATE_PERMUTATIONS
+CROSS JOIN CAR_MODEL_PERMUTATIONS
+CROSS JOIN DATE_DIMENSION_VIEW
+ORDER BY STATE, MODEL, DATE_YYYY_MM_DD);
+
+CREATE OR REPLACE VIEW Completed_Data_Concat_View AS
+SELECT Dealership_ID,
+    Dealership_Sales_Revenue,
+    Dealership_Operational_Expenses,
+    Marketing_Division,
+    Zip_Code,
+    EV_Type,
+    Car_Model,
+    Car_Model_Type,
+    State AS State_Data,
+    Vehicles_Sold,
+    State || '-' || Car_Model || '-' || Date AS CONCAT_KEY_DATA
+FROM COMPLETED_DATA_VIEW;
+
+CREATE OR REPLACE VIEW COMPLETED_MARKET_AWARENESS_VIEW AS 
+SELECT *
+FROM CONCATENATED_VIEW
+LEFT JOIN COMPLETED_DATA_CONCAT_VIEW
+ON CONCATENATED_VIEW.CONCAT_KEY = COMPLETED_DATA_CONCAT_VIEW.CONCAT_KEY_DATA;
+
+
+CREATE OR REPLACE VIEW Market_Awareness_Monthly_Growth_Rate_Pct AS
+SELECT *,
+    LAG(Total_Vehicles_Sold, 1) OVER(PARTITION BY Marketing_Division ORDER BY Month) AS Previous_Num_Vehicles_Sold,
+    (Total_Vehicles_Sold - Previous_Num_Vehicles_Sold) / Total_Vehicles_Sold * 100 AS Monthly_Growth_Rate,
+    LAG(Total_Sales_Revenue, 1) OVER(PARTITION BY Marketing_Division ORDER BY Month) AS Previous_Sales,
+    (Total_Sales_Revenue - Previous_Sales) / Total_Sales_Revenue * 100 AS Monthly_Revenue_Growth_Rate,
+    LAG(Profitability, 1) OVER(PARTITION BY Marketing_Division ORDER BY Month) AS Previous_Profits,
+    (Profitability - Previous_Profits) / Profitability * 100 AS Monthly_Profitability_Growth_Rate
+FROM(
+SELECT MONTH(DATE::DATE) AS Month,
+    Marketing_Division,
+    SUM(Vehicles_Sold) AS Total_Vehicles_Sold,
+    SUM(Dealership_Sales_Revenue) AS Total_Sales_Revenue,
+    SUM(Dealership_Sales_Revenue - DEALERSHIP_OPERATIONAL_EXPENSES) AS Profitability
+FROM COMPLETED_MARKET_AWARENESS_VIEW
+GROUP BY Month, Marketing_Division
+ORDER BY Month, Marketing_Division);
+
+
+CREATE VIEW Product_Monthly_Growth AS
+SELECT *,
+    LAG(Total_Vehicles_Sold, 1) OVER(PARTITION BY Marketing_Division, EV_Type_Edited, Car_Model_Type ORDER BY Month) AS Previous_Vehicles_Sold,
+    (Total_Vehicles_Sold-Previous_Vehicles_Sold) / Total_Vehicles_Sold * 100 AS Growth_Rate
+FROM(
+SELECT MONTH(DATE::DATE) AS Month,
+    Marketing_Division,
+    CASE WHEN EV_TYPE = '-LE' THEN 'LEV'
+        WHEN EV_TYPE = 'LEV' THEN 'LEV'
+        WHEN EV_TYPE = 'SEV' THEN 'SEV'
+        ELSE NULL END AS EV_Type_Edited,
+    Car_Model_Type,
+    AVG(Dealership_Sales_Revenue) AS Average_Revenue,
+    AVG(Dealership_Sales_Revenue - DEALERSHIP_OPERATIONAL_EXPENSES) AS Average_Profitability,
+    AVG((Dealership_Sales_Revenue - DEALERSHIP_OPERATIONAL_EXPENSES) / Dealership_Sales_Revenue * 100) AS Average_Profit_Margin,
+    SUM(Vehicles_Sold) AS Total_Vehicles_Sold
+FROM COMPLETED_MARKET_AWARENESS_VIEW
+GROUP BY Month, Marketing_Division, EV_Type_Edited, Car_Model_Type
+ORDER BY Month, Marketing_Division, EV_Type_Edited, Car_Model_Type)
+WHERE Total_Vehicles_Sold != 0;
+
+
+CREATE VIEW Daily_Sales_Vehicle_Comparison AS
+SELECT DAYOFWEEK(DATE::DATE) AS Dayofweek,
+    CASE WHEN Dayofweek = 0 OR Dayofweek = 6 THEN 'Weekends'
+    ELSE 'Weekdays' END AS Weekends_Weekdays,
+    Marketing_Division,
+    CASE WHEN EV_TYPE = '-LE' THEN 'LEV'
+        WHEN EV_TYPE = 'LEV' THEN 'LEV'
+        WHEN EV_TYPE = 'SEV' THEN 'SEV'
+        ELSE NULL END AS EV_Type_Edited,
+    Car_Model_Type,
+    AVG(Dealership_Sales_Revenue) AS Average_Revenue
+FROM COMPLETED_MARKET_AWARENESS_VIEW
+GROUP BY Dayofweek, Marketing_Division, EV_Type_Edited, Car_Model_Type
+ORDER BY Dayofweek, Marketing_Division, EV_Type_Edited, Car_Model_Type;
+
+CREATE VIEW Market_Awareness_Monthly_Growth_Qtr AS
+SELECT Quarter(Date) AS Quarter,
+    MARKETING_DIVISION,
+    AVG(VEHICLES_SOLD) AS Average_Vehicles_Sold,
+    AVG(DEALERSHIP_SALES_REVENUE) AS Average_Sales_Revenue,
+    AVG(PROFITABILITY) AS Average_Profitability,
+    SUM(VEHICLES_SOLD) AS Total_Vehicles_Sold,
+    SUM(DEALERSHIP_SALES_REVENUE) AS Total_Sales_Revenue,
+    SUM(PROFITABILITY) AS Total_Profitability
+FROM Completed_Data_View
+GROUP BY Quarter, MARKETING_DIVISION
+ORDER BY Quarter, MARKETING_DIVISION;
+
+
+CREATE OR REPLACE VIEW Market_Awareness_Monthly_Growth_Rate_Pct_QTR AS
+SELECT *,
+    LAG(Total_Vehicles_Sold, 1) OVER(PARTITION BY Marketing_Division ORDER BY Quarter) AS Previous_Num_Vehicles_Sold,
+    (Total_Vehicles_Sold - Previous_Num_Vehicles_Sold) / Total_Vehicles_Sold * 100 AS Quartery_Growth_Rate,
+    LAG(Total_Sales_Revenue, 1) OVER(PARTITION BY Marketing_Division ORDER BY Quarter) AS Previous_Sales,
+    (Total_Sales_Revenue - Previous_Sales) / Total_Sales_Revenue * 100 AS Quarterly_Revenue_Growth_Rate,
+    LAG(Profitability, 1) OVER(PARTITION BY Marketing_Division ORDER BY Quarter) AS Previous_Profits,
+    (Profitability - Previous_Profits) / Profitability * 100 AS Quarterly_Profitability_Growth_Rate
+FROM(
+SELECT Quarter(DATE::DATE) AS Quarter,
+    Marketing_Division,
+    SUM(Vehicles_Sold) AS Total_Vehicles_Sold,
+    SUM(Dealership_Sales_Revenue) AS Total_Sales_Revenue,
+    SUM(Dealership_Sales_Revenue - DEALERSHIP_OPERATIONAL_EXPENSES) AS Profitability
+FROM COMPLETED_MARKET_AWARENESS_VIEW
+GROUP BY Quarter, Marketing_Division
+ORDER BY Quarter, Marketing_Division);
+
+
+CREATE VIEW Product_Monthly_Growth_Qtr AS
+SELECT *,
+    LAG(Total_Vehicles_Sold, 1) OVER(PARTITION BY Marketing_Division, EV_Type_Edited, Car_Model_Type ORDER BY Quarter) AS Previous_Vehicles_Sold,
+    (Total_Vehicles_Sold-Previous_Vehicles_Sold) / Total_Vehicles_Sold * 100 AS Growth_Rate
+FROM(
+SELECT Quarter(DATE::DATE) AS Quarter,
+    Marketing_Division,
+    CASE WHEN EV_TYPE = '-LE' THEN 'LEV'
+        WHEN EV_TYPE = 'LEV' THEN 'LEV'
+        WHEN EV_TYPE = 'SEV' THEN 'SEV'
+        ELSE NULL END AS EV_Type_Edited,
+    Car_Model_Type,
+    AVG(Dealership_Sales_Revenue) AS Average_Revenue,
+    AVG(Dealership_Sales_Revenue - DEALERSHIP_OPERATIONAL_EXPENSES) AS Average_Profitability,
+    AVG((Dealership_Sales_Revenue - DEALERSHIP_OPERATIONAL_EXPENSES) / Dealership_Sales_Revenue * 100) AS Average_Profit_Margin,
+    SUM(Vehicles_Sold) AS Total_Vehicles_Sold
+FROM COMPLETED_MARKET_AWARENESS_VIEW
+GROUP BY Quarter, Marketing_Division, EV_Type_Edited, Car_Model_Type
+ORDER BY Quarter, Marketing_Division, EV_Type_Edited, Car_Model_Type)
+WHERE Total_Vehicles_Sold != 0;
+
+
+CREATE VIEW divestment_dealership_aggregation AS
+SELECT Marketing_Division,
+    State,
+    Dealership_ID,
+    AVG(Profitability) AS Avg_Profitability,
+    AVG(Profitability / Dealership_Sales_Revenue) * 100 AS Avg_Profitability_Margin_Pct,
+    CASE WHEN Avg_Profitability_Margin_Pct < 5 THEN 'Low Growth Dealership'
+        WHEN Avg_Profitability_Margin_Pct >= 5 AND Avg_Profitability_Margin_Pct < 10 THEN 'Mid Growth Dealership'
+        WHEN Avg_Profitability_Margin_Pct >= 10 THEN 'High Growth Dealership'
+        END AS Profitability_Criterion
+FROM COMPLETED_DATA_VIEW
+GROUP BY Marketing_Division, State, Dealership_ID
+ORDER BY Marketing_Division, State, Dealership_ID;
+
+
+CREATE VIEW Low_growth_divestment_dealership_aggregation AS
+SELECT * 
+FROM(
+SELECT Marketing_Division,
+    State,
+    Dealership_ID,
+    EV_Type,
+    Car_Model_Type,
+    AVG(Profitability) AS Avg_Profitability,
+    AVG(Profitability / Dealership_Sales_Revenue) * 100 AS Avg_Profitability_Margin_Pct,
+    CASE WHEN Avg_Profitability_Margin_Pct < 5 THEN 'Low Growth Dealership'
+        WHEN Avg_Profitability_Margin_Pct >= 5 AND Avg_Profitability_Margin_Pct < 10 THEN 'Mid Growth Dealership'
+        WHEN Avg_Profitability_Margin_Pct >= 10 THEN 'High Growth Dealership'
+        END AS Profitability_Criterion
+FROM COMPLETED_DATA_VIEW
+GROUP BY Marketing_Division, State, Dealership_ID, EV_Type, Car_Model_Type
+ORDER BY Marketing_Division, State, Dealership_ID, EV_Type, Car_Model_Type)
+WHERE Profitability_Criterion = 'Low Growth Dealership';
